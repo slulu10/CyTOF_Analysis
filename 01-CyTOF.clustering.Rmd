@@ -1,0 +1,252 @@
+
+Read the FCSs
+```{r}
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(readxl)
+
+library(flowCore)
+library(CATALYST)
+library(FlowSOM)
+
+library(ggplot2)
+library(ggpubr)
+
+library(ComplexHeatmap)
+library(cowplot)
+
+#BiocManager::install("diffcyt")
+library(diffcyt)
+```
+#Load FCS and metadata files
+```{r}
+prefix <- "CyTOF.analysis"
+#FCSdir <- "path to cleaned FCS files as in metadata.xlsx sample table"
+printGraph <- F
+fixed_seed <- 1234
+
+sampleTable <- read_excel("Metadata.xlsx",sheet="Samples") %>%
+    mutate(sample_id=paste(patient_id,Tx_Group,timepoint,sep="."))
+
+sampleTable$Tx_Group <- factor(sampleTable$Tx_Group, levels = c("Placebo", "PolyICLC","Resiquimod"))
+sampleTable$timepoint <- factor(sampleTable$timepoint, levels = c("Day0", "Day1","Day29"))
+
+View(sampleTable)
+table(sampleTable$Tx_Group,sampleTable$timepoint)
+
+fs <- read.flowSet(files=sampleTable$file_name,path=FCSdir,name.keyword = sampleTable$sample_id,transformation=F)
+
+##this is needed so that prepData will include all markers
+for(i in 1:length(fs)){
+    keyword(fs[[i]])[["$CYT"]] <- "FACS"
+}
+```
+
+
+```{r}
+panel <- read_excel("Metadata.xlsx",sheet="MarkerList")
+all(panel$antigen %in% colnames(fs))
+```
+
+```{r}
+sce <- prepData(fs, panel, sampleTable, 
+                panel_cols = list(channel = "fcs_colname", antigen = "antigen", class = "marker_class"),
+                md_cols=list(file = "file_name", id = "sample_id", factors = c("Tx_Group","timepoint","patient_id")))
+```
+
+#Print some QC plots
+```{r}
+if(printGraph){
+    p <- plotExprs(sce, color_by = "Tx_Group")
+    p$facet$params$ncol <- 6
+    ggsave(p, filename = paste(prefix,"QC.by.Tx_Group.pdf",sep="."),
+           width=180,
+           height=180,
+           units="mm")
+    p <- plotExprs(sce, color_by = "timepoint")
+    p$facet$params$ncol <- 6
+    
+    ggsave(p, filename = paste(prefix,"QC.by.timepoint.pdf",sep="."),
+           width=180,
+           height=180,
+           units="mm")
+    
+    p <- pbMDS(sce, color_by = "Tx_Group", label_by = "sample_id")
+    ggsave(p, filename = paste(prefix,"MDSplot.Tx_Group.pdf",sep="."),
+           width=180,
+           height=180,
+           units="mm")
+    
+    p <- pbMDS(sce, color_by = "timepoint", label_by = "sample_id")
+    ggsave(p, filename = paste(prefix,"MDSplot.timepoint.pdf",sep="."),
+           width=180,
+           height=180,
+           units="mm")
+}
+
+```
+
+#FlowSOM clustering using only Lineage markers (just for testing)
+```{r}
+set.seed(fixed_seed)
+sce <- cluster(sce, features = "type",
+               xdim = 10, ydim = 10, maxK = 20, seed = 1234)
+
+if(printGraph){
+    p <- plotExprHeatmap(sce, features = "type", 
+                         by = "cluster_id", k = "meta20", 
+                         bars = TRUE, perc = TRUE)
+    class(p)
+    
+    pdf(file = paste(prefix,"FlowSOM.ConsensusClust.k20.LineageMarkers.pdf",
+                     sep="."), width=7.5, height=5)
+    draw(p)
+    dev.off()
+}
+
+if(saveRDS){
+    saveRDS(sce,file=paste(prefix,"SCE.clustSOM100.k20.byCellTypeMarkers.rds",sep="."))
+}
+
+#sce <- readRDS(file=paste(prefix,"SCE.clustSOM100.k20.byCellTypeMarkers.rds"))
+```
+# run t-SNE/UMAP on at most 1000/3000 cells per sample
+# this make sure that no samples disproportionately affects the clustering
+# also saves run time
+```{r}
+set.seed(fixed_seed)
+sce <- runDR(sce, "TSNE", cells = 1e3, features = "type")
+sce <- runDR(sce, "UMAP", cells = 1e3, features = "type")
+
+
+p1 <- plotDR(sce, "TSNE", color_by = "meta20") + 
+    theme(legend.position = "none")
+p1$layers[[1]]$aes_params$size <- p1$layers[[1]]$aes_params$size/10
+
+p2 <- plotDR(sce, "UMAP", color_by = "meta20")
+p2$layers[[1]]$aes_params$size <- p2$layers[[1]]$aes_params$size/10
+
+lgd <- get_legend(p2)
+p2 <- p2 + theme(legend.position = "none")
+p <- plot_grid(p1, p2, lgd, nrow = 1, rel_widths = c(5, 5, 2))
+ggsave(p,filename = paste(prefix,"TSNE.UMAP.byMeta20.pdf",sep="."),
+       width=240,
+       height=120,
+       units="mm")
+
+
+if(saveRDS){
+    saveRDS(sce,file=paste(prefix,"SCE.clustSOM100.k20.byCellTypeMarkers.tSNE.UMAP.rds",sep="."))
+    #sce <- readRDS(file=paste(prefix,"SCE.clustSOM100.k20.byCellTypeMarkers.tSNE.UMAP.rds"))
+}
+```
+
+
+
+#FlowSOM clustering using all markers (we use this for subsequent analysis)
+```{r}
+
+sce_all <- cluster(sce, features = panel$fcs_colname,
+                   xdim = 10, ydim = 10, maxK = 20, seed = 1234)
+
+p <- plotExprHeatmap(sce_all, features = panel$fcs_colname,
+                     by = "cluster_id", k = "meta20",
+                     bars = TRUE, perc = TRUE)
+class(p)
+
+pdf(file = paste(prefix,"FlowSOM.ConsensusClust.k20.AllMarkers.pdf",sep="."),
+    width=10,
+    height=5)
+draw(p)
+dev.off()
+
+if(saveRDS){
+    saveRDS(sce_all,file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.rds",sep="."))
+}
+# sce_all <- readRDS(file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.rds",sep="."))
+
+```
+
+# run t-SNE/UMAP on at most 1000/3000 cells per sample
+```{r}
+set.seed(fixed_seed)
+sce_all <- runDR(sce_all, "TSNE", cells = 1e3, features = "type")
+sce_all <- runDR(sce_all, "UMAP", cells = 1e3, features = "type")
+
+p1 <- plotDR(sce_all, "TSNE", color_by = "meta20") + 
+    theme(legend.position = "none")
+p1$layers[[1]]$aes_params$size <- p1$layers[[1]]$aes_params$size/10
+
+p2 <- plotDR(sce_all, "UMAP", color_by = "meta20")
+p2$layers[[1]]$aes_params$size <- p2$layers[[1]]$aes_params$size/10
+
+lgd <- get_legend(p2)
+p2 <- p2 + theme(legend.position = "none")
+p <- plot_grid(p1, p2, lgd, nrow = 1, rel_widths = c(5, 5, 2))
+ggsave(p,filename = paste(prefix,"TSNE.UMAP.byMeta20.allMarkers.pdf",sep="."),
+       width=240,
+       height=120,
+       units="mm")
+
+if(saveRDS){
+    saveRDS(sce_all,file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.tSNE.UMAP.rds",sep="."))
+    sce_all <- readRDS(file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.tSNE.UMAP.rds",sep="."))
+}
+```
+
+#Merge Clusters based on manual annotation
+```{r}
+merging_table1_file <- "ClusterMerging_AllMarkers.xlsx"
+merging_table1 <- read_excel(merging_table1_file,sheet="Mapping",range="A1:B21")
+color_table1 <- read_excel(merging_table1_file,sheet="Color")
+View(merging_table1)
+
+merging_table1$new_cluster <- factor(merging_table1$new_cluster, 
+                                     levels = color_table1$cluster_name)
+
+colorList <- color_table1$color
+names(colorList) <- color_table1$cluster_name
+colorList
+
+sce_all <- mergeClusters(sce_all, k = "meta20", 
+                         table = merging_table1, id = "merging1",overwrite = T)
+
+```
+
+
+###draw plots
+```{r}
+p1 <- plotDR(sce_all, "TSNE", color_by = "merging1", k_pal = colorList) + 
+    theme(legend.position = "none")
+p1$layers[[1]]$aes_params$size <- p1$layers[[1]]$aes_params$size/10
+
+p2 <- plotDR(sce_all, "UMAP", color_by = "merging1", k_pal = colorList)
+p2$layers[[1]]$aes_params$size <- p2$layers[[1]]$aes_params$size/10
+
+lgd <- get_legend(p2)
+p2 <- p2 + theme(legend.position = "none")
+p <- plot_grid(p1, p2, lgd, nrow = 1, rel_widths = c(5, 5, 2))
+ggsave(p,filename = paste(prefix,"TSNE.UMAP.byManualAnnot.allMarkers.pdf",sep="."),
+       width=240,
+       height=120,
+       units="mm")
+
+p <- plotExprHeatmap(sce_all, features = panel$fcs_colname,
+                     by = "cluster_id", k = "merging1",bars = TRUE, perc = TRUE)
+
+pdf(file = paste(prefix,"Heatmap.ManualAnnot.AllMarkers.pdf",sep="."),
+    width=10,
+    height=5)
+draw(p)
+dev.off()
+
+if(saveRDS){
+    saveRDS(sce_all,file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.tSNE.UMAP.merged.rds",sep="."))
+    #sce_all <- readRDS(file=paste(prefix,"SCE.clustSOM100.k20.byAllMarkers.tSNE.UMAP.merged.rds",sep="."))
+}
+
+##The clustering and manual merging up to this point, below are visualizations
+##Can move to another script
+```
+
